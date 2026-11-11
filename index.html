@@ -144,403 +144,268 @@
     </footer>
 
     <script>
-        const REFRESH_INTERVAL = 30; // 30 秒更新一次巴士 ETA
+        'use strict';
+        const REFRESH_INTERVAL = 30;
+        const WEATHER_INTERVAL = 30 * 60 * 1000;
         let countdown = REFRESH_INTERVAL;
         let globalTimer = null;
-        let allStops = []; // 全港巴士站緩存 (快取大資料)
+        let allStops = [];
+        let isUpdatingAll = false;
+        let stopsLoaded = false;
 
-        // 固定監控配置：青衣碼頭與翠怡花園
+        // 使用 API 的實際中文站名作比對；顯示名稱可保留站號括號。
         const DEFAULT_MONITORS = [
-            {
-                id: "monitor_1",
-                route: "44M",
-                stopName: "青衣碼頭 (TY217)",
-                stopNameEn: "TSING YI FERRY",
-                direction: "往葵涌邨方向"
-            },
-            {
-                id: "monitor_2",
-                route: "44M",
-                stopName: "翠怡花園 (TY243)",
-                stopNameEn: "GREENFIELD GARDEN",
-                direction: "往葵涌邨方向"
-            }
+            { id: 'monitor_1', route: '44M', stopName: '青衣碼頭 (TY217)', stopNameTc: '青衣碼頭', stopNameEn: 'TSING YI FERRY', direction: '往葵涌邨方向', stopId: '' },
+            { id: 'monitor_2', route: '44M', stopName: '翠怡花園 (TY243)', stopNameTc: '翠怡花園', stopNameEn: 'GREENFIELD GARDEN', direction: '往葵涌邨方向', stopId: '' }
         ];
+        const monitors = DEFAULT_MONITORS;
+        const $ = id => document.getElementById(id);
+        const globalLoader = $('global-loader');
+        const loaderStatus = $('loader-status');
+        const cacheStatusEl = $('cache-status');
+        const monitorsGridEl = $('monitors-grid');
+        const emptyStateEl = $('empty-state');
+        const totalMonitorsCountEl = $('total-monitors-count');
+        const btnRefreshAllEl = $('btn-refresh-all');
+        const refreshIconEl = $('refresh-icon');
+        const countdownCircleEl = $('countdown-circle');
+        const refreshLabelEl = $('refresh-label');
 
-        let monitors = DEFAULT_MONITORS;
+        async function fetchJson(url, timeoutMs = 12000) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch(url, { method: 'GET', cache: 'no-store', signal: controller.signal });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                if (!data || !Object.prototype.hasOwnProperty.call(data, 'data')) {
+                    throw new Error('API 回應格式不正確');
+                }
+                return data;
+            } catch (err) {
+                if (err.name === 'AbortError') throw new Error('連線逾時，請稍後重試');
+                throw err;
+            } finally {
+                clearTimeout(timeout);
+            }
+        }
 
-        // DOM 元素引用
-        const globalLoader = document.getElementById('global-loader');
-        const loaderStatus = document.getElementById('loader-status');
-        const cacheStatusEl = document.getElementById('cache-status');
-        const monitorsGridEl = document.getElementById('monitors-grid');
-        const emptyStateEl = document.getElementById('empty-state');
-        const totalMonitorsCountEl = document.getElementById('total-monitors-count');
-        const btnRefreshAllEl = document.getElementById('btn-refresh-all');
-        const refreshIconEl = document.getElementById('refresh-icon');
-        const countdownCircleEl = document.getElementById('countdown-circle');
-        const refreshLabelEl = document.getElementById('refresh-label');
-
-        // 1. 動態更新導航時鐘功能 (實時每秒更新)
         function updateClock() {
             const now = new Date();
-            const year = now.getFullYear();
-            const month = String(now.getMonth() + 1).padStart(2, '0');
-            const date = String(now.getDate()).padStart(2, '0');
-            
-            const days = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
-            const dayName = days[now.getDay()];
-            
-            let hours = now.getHours();
-            const ampm = hours >= 12 ? 'PM' : 'AM';
-            hours = hours % 12;
-            hours = hours ? hours : 12; // 0點應顯示為12點
-            const minutes = String(now.getMinutes()).padStart(2, '0');
-            
-            const timeStr = `${hours}:${minutes} ${ampm}`;
-            const dateStr = `${year}-${month}-${date}`;
-            
-            document.getElementById('clock-time').textContent = timeStr;
-            document.getElementById('clock-date').textContent = dateStr;
-            document.getElementById('clock-day').textContent = dayName;
+            $('clock-time').textContent = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            $('clock-date').textContent = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+            $('clock-day').textContent = ['星期日','星期一','星期二','星期三','星期四','星期五','星期六'][now.getDay()];
         }
 
-        // 2. 獲取香港天文台實時天氣與分區溫度
         async function fetchWeather() {
+            const tempEl = $('weather-temp');
+            const placeEl = $('weather-place');
             try {
-                const response = await fetch("https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=tc");
-                const data = await response.json();
-                
-                // A. 更新天氣ICON (使用天文台官方Outline圖標，更簡潔好看)
-                if (data.icon && data.icon.length > 0) {
-                    const iconId = data.icon[0];
-                    const iconImg = document.getElementById('weather-icon');
-                    iconImg.src = `https://www.hko.gov.hk/images/HKOWxIconOutline/pic${iconId}.png`;
+                const data = await fetchJson('https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=tc');
+                if (Array.isArray(data.icon) && data.icon.length) {
+                    const iconImg = $('weather-icon');
+                    iconImg.src = `https://www.hko.gov.hk/images/HKOWxIconOutline/pic${encodeURIComponent(data.icon[0])}.png`;
                     iconImg.classList.remove('hidden');
                 }
-                
-                // B. 精確查找「青衣」分區氣溫，若無數據則回退到「香港天文台」市區溫度
-                if (data.temperature && data.temperature.data) {
-                    let targetTemp = data.temperature.data.find(t => t.place === "青衣");
-                    if (!targetTemp) {
-                        targetTemp = data.temperature.data.find(t => t.place === "香港天文台") || data.temperature.data[0];
-                    }
-                    
-                    if (targetTemp) {
-                        document.getElementById('weather-temp').textContent = `${targetTemp.value}°C`;
-                        document.getElementById('weather-place').textContent = targetTemp.place;
-                    }
+                const temps = data.temperature && Array.isArray(data.temperature.data) ? data.temperature.data : [];
+                const target = temps.find(t => t.place === '青衣') || temps.find(t => t.place === '香港天文台') || temps[0];
+                if (target && Number.isFinite(Number(target.value))) {
+                    tempEl.textContent = `${target.value}°C`;
+                    placeEl.textContent = target.place || '香港';
+                } else {
+                    tempEl.textContent = '--°C';
+                    placeEl.textContent = '暫無天氣資料';
                 }
             } catch (err) {
-                console.error("無法同步天文台天氣數據", err);
+                console.warn('天氣同步失敗：', err.message);
+                if (tempEl.textContent === '--°C') placeEl.textContent = '天氣連線失敗';
             }
         }
 
-        // 3. 初始化系統：讀取全港巴士站清單
         async function fetchAllStops() {
+            loaderStatus.textContent = '正在連接政府巴士站點資料...';
+            cacheStatusEl.innerHTML = '<i class="fa-solid fa-circle-notch animate-spin"></i> 正在連線...';
             try {
-                loaderStatus.textContent = "正在向政府 Open Data 伺服器載入全港巴士站清單...";
-                cacheStatusEl.innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i> 正在連線...`;
-                
-                const response = await fetch("https://data.etabus.gov.hk/v1/transport/kmb/stop");
-                const resData = await response.json();
-                allStops = resData.data;
-                
+                const payload = await fetchJson('https://data.etabus.gov.hk/v1/transport/kmb/stop');
+                if (!Array.isArray(payload.data)) throw new Error('站點清單格式不正確');
+                allStops = payload.data;
+                stopsLoaded = true;
                 cacheStatusEl.innerHTML = `<span class="text-emerald-500 font-semibold"><i class="fa-solid fa-circle-check"></i> ${allStops.length.toLocaleString()} 個站點已載入</span>`;
+                resolveAllMonitorUuids();
                 return true;
             } catch (err) {
-                cacheStatusEl.innerHTML = `<span class="text-rose-500 font-semibold"><i class="fa-solid fa-triangle-exclamation"></i> 載入失敗</span>`;
-                loaderStatus.textContent = "❌ 無法取得全港站點清單，請檢查網路連線。";
-                console.error("無法取得全港站點清單", err);
+                stopsLoaded = false;
+                cacheStatusEl.innerHTML = '<span class="text-rose-500 font-semibold"><i class="fa-solid fa-triangle-exclamation"></i> 站點資料載入失敗</span>';
+                loaderStatus.textContent = `載入失敗：${err.message}。可按「立即同步」重試。`;
+                console.error('無法取得全港站點清單：', err);
                 return false;
             }
         }
 
-        // 4. 核心精確名稱 UUID 轉碼器：比對 name_tc 完全等於目標字串
-        function resolveStopUuid(stopName) {
-            const stopInfo = allStops.find(stop => stop.name_tc === stopName);
-            return stopInfo ? stopInfo.stop : null;
+        function normalizeStopName(value) {
+            return String(value || '').replace(/[\s　]/g, '').replace(/[（(].*?[）)]/g, '').trim();
         }
-
-        // 當載入完成後，確保所有 monitor 都有正確的 16 位元 stopId UUID
+        function resolveStopUuid(stopName) {
+            const target = normalizeStopName(stopName);
+            let stop = allStops.find(item => normalizeStopName(item.name_tc) === target);
+            if (!stop) stop = allStops.find(item => normalizeStopName(item.name_tc).includes(target) || target.includes(normalizeStopName(item.name_tc)));
+            return stop ? stop.stop : null;
+        }
         function resolveAllMonitorUuids() {
             monitors.forEach(monitor => {
-                if (!monitor.stopId || monitor.stopId.length !== 16) {
-                    const uuid = resolveStopUuid(monitor.stopName);
-                    if (uuid) {
-                        monitor.stopId = uuid;
-                    }
-                }
+                const exactName = monitor.stopNameTc || monitor.stopName;
+                const uuid = resolveStopUuid(exactName);
+                if (uuid) monitor.stopId = uuid;
             });
         }
 
-        // 5. 渲染看板骨架 (中英文同大小橫向並排，站點與英文恢復精簡尺寸)
         function renderDashboard() {
             monitorsGridEl.innerHTML = '';
             totalMonitorsCountEl.textContent = `共監控 ${monitors.length} 個站點`;
-
-            if (monitors.length === 0) {
+            if (!monitors.length) {
                 emptyStateEl.classList.remove('hidden');
                 monitorsGridEl.classList.add('hidden');
                 return;
             }
-
             emptyStateEl.classList.add('hidden');
             monitorsGridEl.classList.remove('hidden');
-
             monitors.forEach(monitor => {
                 const card = document.createElement('div');
                 card.id = `card-${monitor.id}`;
-                card.className = "bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl hover:border-slate-700 transition-all duration-300 flex flex-col no-scrollbar";
+                card.className = 'bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl hover:border-slate-700 transition-all duration-300 flex flex-col no-scrollbar';
                 card.innerHTML = `
-                    <!-- 卡片頂部 -->
                     <div class="bg-slate-950 p-6 border-b border-slate-800/80 flex justify-between items-center gap-4">
-                        <div class="flex items-center gap-5">
-                            <!-- 巴士號碼 Badge (保持放大) -->
-                            <div class="bg-red-600 text-white font-black text-3xl px-5 py-2.5 rounded-xl shadow-md font-mono tracking-tighter flex items-center justify-center">
-                                ${monitor.route}
-                            </div>
-                            <div>
-                                <!-- 中英文橫向並排 (按用戶需求，文字維持原經典大小 text-lg，英文 text-sm) -->
-                                <h3 class="font-extrabold text-white text-lg tracking-wide flex items-center gap-4 flex-wrap">
-                                    <span>${monitor.stopName.split(' ')[0]}</span>
-                                    <span class="text-slate-400 font-semibold uppercase text-sm sm:text-base">${monitor.stopNameEn || ''}</span>
-                                </h3>
-                                <p class="text-xs text-slate-500 mt-1.5 flex items-center gap-1.5 font-semibold">
-                                    <i class="fa-solid fa-circle-chevron-right text-[10px] text-slate-600"></i>${monitor.direction}
-                                </p>
-                            </div>
+                        <div class="flex items-center gap-5 min-w-0">
+                            <div class="bg-red-600 text-white font-black text-3xl px-5 py-2.5 rounded-xl shadow-md font-mono tracking-tighter flex items-center justify-center">${monitor.route}</div>
+                            <div class="min-w-0"><h3 class="font-extrabold text-white text-lg tracking-wide flex items-center gap-4 flex-wrap"><span>${monitor.stopName}</span><span class="text-slate-400 font-semibold uppercase text-sm sm:text-base">${monitor.stopNameEn}</span></h3><p class="text-xs text-slate-500 mt-1.5 flex items-center gap-1.5 font-semibold"><i class="fa-solid fa-circle-chevron-right text-[10px] text-slate-600"></i>${monitor.direction}</p></div>
                         </div>
-                        <div>
-                            <button onclick="updateSingleEta('${monitor.id}')" class="text-slate-400 hover:text-white p-2.5 rounded-xl hover:bg-slate-800 transition-colors" title="立即手動更新">
-                                <i class="fa-solid fa-arrows-rotate text-lg" id="sync-icon-${monitor.id}"></i>
-                            </button>
-                        </div>
+                        <button type="button" data-refresh-id="${monitor.id}" class="text-slate-400 hover:text-white p-2.5 rounded-xl hover:bg-slate-800 transition-colors" title="立即更新此站"><i class="fa-solid fa-arrows-rotate text-lg" id="sync-icon-${monitor.id}"></i></button>
                     </div>
-
-                    <!-- 到站列表內容區 (全面放大 LED 時間，首班 text-4xl，其餘 text-3xl) -->
-                    <div class="p-6 flex-grow bg-slate-900/40 no-scrollbar overflow-hidden">
-                        <div class="w-full overflow-x-auto no-scrollbar">
-                            <table class="w-full text-left text-base min-w-[300px]">
-                                <thead class="text-sm uppercase text-slate-500 border-b border-slate-800/50">
-                                    <tr>
-                                        <th class="pb-4 font-bold tracking-wider">班次</th>
-                                        <th class="pb-4 font-bold tracking-wider text-center">預計時間</th>
-                                        <th class="pb-4 font-bold tracking-wider text-right">剩餘時間</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="eta-list-${monitor.id}" class="divide-y divide-slate-800/30">
-                                    <tr>
-                                        <td colspan="3" class="py-16 text-center text-slate-400 text-lg">
-                                            <i class="fa-solid fa-circle-notch animate-spin text-2xl mb-3 block text-amber-500"></i>正在載入實時數據...
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <!-- 底部 UUID 與更新狀態 -->
-                    <div class="bg-slate-950/80 border-t border-slate-800/50 px-6 py-4 flex justify-between items-center text-xs sm:text-sm text-slate-500 font-mono font-medium">
-                        <span>站點 ID: ${monitor.stopId ? monitor.stopId.substring(0,8) + '...' : '等待解析'}</span>
-                        <span id="update-time-${monitor.id}">待同步</span>
-                    </div>
-                `;
+                    <div class="p-6 flex-grow bg-slate-900/40 no-scrollbar overflow-hidden"><div class="w-full overflow-x-auto no-scrollbar"><table class="w-full text-left text-base min-w-[300px]"><thead class="text-sm uppercase text-slate-500 border-b border-slate-800/50"><tr><th class="pb-4 font-bold tracking-wider">班次</th><th class="pb-4 font-bold tracking-wider text-center">預計時間</th><th class="pb-4 font-bold tracking-wider text-right">剩餘時間</th></tr></thead><tbody id="eta-list-${monitor.id}" class="divide-y divide-slate-800/30"><tr><td colspan="3" class="py-16 text-center text-slate-400 text-lg">等待載入實時數據...</td></tr></tbody></table></div></div>
+                    <div class="bg-slate-950/80 border-t border-slate-800/50 px-6 py-4 flex justify-between items-center text-xs sm:text-sm text-slate-500 font-mono font-medium"><span>站點 ID: <span id="stop-id-${monitor.id}">${monitor.stopId ? monitor.stopId.slice(0,8)+'…' : '待解析'}</span></span><span id="update-time-${monitor.id}">待同步</span></div>`;
                 monitorsGridEl.appendChild(card);
             });
+            monitorsGridEl.querySelectorAll('[data-refresh-id]').forEach(btn => btn.addEventListener('click', () => updateSingleEta(btn.dataset.refreshId)));
         }
 
-        // 6. 抓取單卡 ETA 數據並進行純數值排序與渲染
+        function showEtaMessage(listEl, message, isError = false) {
+            listEl.innerHTML = `<tr><td colspan="3" class="py-16 text-center ${isError ? 'text-rose-500' : 'text-slate-400'} text-lg"><i class="fa-solid ${isError ? 'fa-circle-exclamation' : 'fa-clock'} text-2xl mb-3 block"></i>${message}</td></tr>`;
+        }
         async function updateSingleEta(id) {
-            const monitor = monitors.find(m => m.id === id);
+            const monitor = monitors.find(item => item.id === id);
             if (!monitor) return;
-
-            const listEl = document.getElementById(`eta-list-${id}`);
-            const timeEl = document.getElementById(`update-time-${id}`);
-            const syncIcon = document.getElementById(`sync-icon-${id}`);
-
+            const listEl = $(`eta-list-${id}`);
+            const timeEl = $(`update-time-${id}`);
+            const syncIcon = $(`sync-icon-${id}`);
+            if (!listEl || !timeEl) return;
             if (syncIcon) syncIcon.classList.add('animate-spin', 'text-amber-500');
-
-            if (!monitor.stopId || monitor.stopId.length !== 16) {
-                const uuid = resolveStopUuid(monitor.stopName);
-                if (uuid) {
-                    monitor.stopId = uuid;
-                } else {
-                    listEl.innerHTML = `
-                        <tr>
-                            <td colspan="3" class="py-16 text-center text-rose-500 text-lg">
-                                <i class="fa-solid fa-circle-exclamation text-2xl mb-2 block"></i>名稱解析失敗，無法查詢。
-                            </td>
-                        </tr>
-                    `;
-                    if (syncIcon) syncIcon.classList.remove('animate-spin', 'text-amber-500');
-                    return;
-                }
-            }
-
             try {
-                // 使用極速單站點 ETA API
-                const response = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/${monitor.stopId}`);
-                const resData = await response.json();
-                
-                // 過濾該站點中對應路線的數據
-                const routeEta = resData.data.filter(item => item.route === monitor.route);
-                
-                const now = new Date();
-                const processedList = [];
-
-                routeEta.forEach(item => {
-                    if (!item.eta) return;
-                    const etaTime = new Date(item.eta);
-                    const diffMs = etaTime - now;
-                    const minutesLeft = Math.round(diffMs / 1000 / 60);
-
-                    // 精準過濾：只保留還沒離開的班次 (剩餘時間 >= 0 分鐘)
-                    if (minutesLeft >= 0) {
-                        processedList.push({
-                            sortMinutes: minutesLeft, // 用於純數值排序
-                            timeStr: etaTime.toTimeString().substring(0, 5),
-                            rmk: item.rmk_tc || '即時班次'
-                        });
-                    }
-                });
-
-                // 核心：依據剩餘時間由小到大排序
-                processedList.sort((a, b) => a.sortMinutes - b.sortMinutes);
-
-                // 渲染至 HTML (大字體 LED 設計：首班 4xl，次班 3xl)
-                if (processedList.length === 0) {
-                    listEl.innerHTML = `
-                        <tr>
-                            <td colspan="3" class="py-16 text-center text-slate-400 text-lg font-bold">
-                                <i class="fa-regular fa-clock text-2xl mb-3 block text-slate-500"></i>服務已結束或近期無班次
-                            </td>
-                        </tr>
-                    `;
-                } else {
-                    listEl.innerHTML = '';
-                    processedList.forEach((eta, index) => {
-                        let badgeColor = "bg-slate-800/80 text-slate-400 border border-slate-700/50";
-                        if (index === 0) badgeColor = "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30";
-                        else if (index === 1) badgeColor = "bg-amber-500/15 text-amber-500 border border-amber-500/30";
-
-                        // LED 樣式配置：第一班綠色，後續琥珀色 (字體再放大，首班 4xl，後續 3xl)
-                        const isFirst = index === 0;
-                        const ledTextClass = isFirst ? "led-green-text text-emerald-400 font-extrabold font-mono text-4xl" : "led-text text-amber-500 font-extrabold font-mono text-3xl";
-                        const minutesDisplay = eta.sortMinutes === 0 ? "即將抵達" : `${eta.sortMinutes} 分鐘`;
-
-                        listEl.innerHTML += `
-                            <tr class="hover:bg-slate-900/50 transition-colors">
-                                <td class="py-6">
-                                    <span class="px-4 py-2 text-base sm:text-lg font-black rounded ${badgeColor}">
-                                        第 ${index + 1} 班
-                                    </span>
-                                </td>
-                                <td class="py-6 text-center text-slate-200 font-mono font-bold text-2xl">${eta.timeStr}</td>
-                                <td class="py-6 text-right">
-                                    <div class="${ledTextClass} tracking-tight">
-                                        ${minutesDisplay}
-                                    </div>
-                                    <div class="text-xs text-slate-500 font-semibold mt-1">${eta.rmk}</div>
-                                </td>
-                            </tr>
-                        `;
-                    });
+                if (!stopsLoaded || !allStops.length) {
+                    const ok = await fetchAllStops();
+                    if (ok && monitorsGridEl.children.length === 0) renderDashboard();
                 }
-
-                timeEl.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-500"></i> 同步時間: ${now.toTimeString().substring(0, 8)}`;
-
+                if (!monitor.stopId) monitor.stopId = resolveStopUuid(monitor.stopNameTc || monitor.stopName);
+                if (!monitor.stopId) throw new Error(`找不到「${monitor.stopNameTc}」站點。請確認站名或稍後重試。`);
+                const payload = await fetchJson(`https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/${encodeURIComponent(monitor.stopId)}`);
+                if (!Array.isArray(payload.data)) throw new Error('ETA 回應格式不正確');
+                const nowMs = Date.now();
+                const seen = new Set();
+                const arrivals = payload.data.filter(item => item.route === monitor.route && item.eta)
+                    .map(item => {
+                        const etaMs = Date.parse(item.eta);
+                        if (!Number.isFinite(etaMs)) return null;
+                        const diffMs = etaMs - nowMs;
+                        if (diffMs < -30000) return null; // 忽略已過站超過 30 秒的預報
+                        const key = `${item.route}|${item.eta}|${item.dest_tc || ''}`;
+                        if (seen.has(key)) return null;
+                        seen.add(key);
+                        return { etaMs, minutes: Math.max(0, Math.ceil(diffMs / 60000)), timeStr: new Date(etaMs).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }), remark: item.rmk_tc || '實時預報' };
+                    }).filter(Boolean).sort((a,b) => a.etaMs - b.etaMs).slice(0, 5);
+                if (!arrivals.length) {
+                    showEtaMessage(listEl, '目前沒有可用的到站預報（可能未有班次或資料暫缺）');
+                } else {
+                    listEl.innerHTML = arrivals.map((eta, index) => {
+                        const badge = index === 0 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30' : index === 1 ? 'bg-amber-500/15 text-amber-500 border border-amber-500/30' : 'bg-slate-800/80 text-slate-400 border border-slate-700/50';
+                        const timeClass = index === 0 ? 'text-emerald-400 text-4xl' : 'text-amber-500 text-3xl';
+                        const remaining = eta.minutes === 0 ? '即將抵達' : `${eta.minutes} 分鐘`;
+                        return `<tr class="hover:bg-slate-900/50 transition-colors"><td class="py-6"><span class="px-4 py-2 text-base sm:text-lg font-black rounded ${badge}">第 ${index+1} 班</span></td><td class="py-6 text-center text-slate-200 font-mono font-bold text-2xl">${eta.timeStr}</td><td class="py-6 text-right"><div class="${timeClass} font-extrabold font-mono tracking-tight">${remaining}</div><div class="text-xs text-slate-500 font-semibold mt-1">${eta.remark}</div></td></tr>`;
+                    }).join('');
+                }
+                const stopIdEl = $(`stop-id-${id}`);
+                if (stopIdEl) stopIdEl.textContent = monitor.stopId.slice(0,8) + '…';
+                timeEl.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-500"></i> 更新：${new Date().toLocaleTimeString('en-GB', {hour12:false})}`;
             } catch (err) {
-                console.error("更新單卡 ETA 失敗", err);
-                listEl.innerHTML = `
-                    <tr>
-                        <td colspan="3" class="py-16 text-center text-rose-500 text-lg">
-                            <i class="fa-solid fa-circle-xmark text-2xl mb-2 block"></i>連線伺服器失敗
-                        </td>
-                    </tr>
-                `;
-                timeEl.innerHTML = `<span class="text-rose-500 font-semibold"><i class="fa-solid fa-triangle-exclamation"></i> 錯誤</span>`;
+                console.error(`更新 ${monitor.stopName} ETA 失敗：`, err);
+                showEtaMessage(listEl, err.message || '連線伺服器失敗，請稍後重試', true);
+                timeEl.innerHTML = '<span class="text-rose-500 font-semibold"><i class="fa-solid fa-triangle-exclamation"></i> 更新失敗</span>';
             } finally {
                 if (syncIcon) syncIcon.classList.remove('animate-spin', 'text-amber-500');
             }
         }
 
-        // 7. 全局刷新所有監控
         async function updateAllEtas() {
+            if (isUpdatingAll) return;
+            isUpdatingAll = true;
             btnRefreshAllEl.disabled = true;
             refreshIconEl.classList.add('animate-spin');
-            
-            const promises = monitors.map(m => updateSingleEta(m.id));
-            await Promise.all(promises);
-            
-            btnRefreshAllEl.disabled = false;
-            refreshIconEl.classList.remove('animate-spin');
+            try {
+                if (!stopsLoaded) {
+                    const ok = await fetchAllStops();
+                    if (ok) {
+                        resolveAllMonitorUuids();
+                        renderDashboard();
+                    }
+                }
+                await Promise.all(monitors.map(monitor => updateSingleEta(monitor.id)));
+            } finally {
+                isUpdatingAll = false;
+                btnRefreshAllEl.disabled = false;
+                refreshIconEl.classList.remove('animate-spin');
+            }
         }
 
-        // 8. 定時倒數機制 (30秒) 與時鐘刷新 (1秒)
         function startTimer() {
             if (globalTimer) clearInterval(globalTimer);
-            
-            // 每秒觸發的計時器，用於更新時鐘與倒數
+            countdown = REFRESH_INTERVAL;
             globalTimer = setInterval(() => {
-                // 更新時鐘
                 updateClock();
-                
-                // 減少倒數時間
-                countdown--;
-                
-                // 更新計時器圈圈百分比 (使用 81.7 作為最大圓周)
-                const offset = (countdown / REFRESH_INTERVAL) * 81.7;
-                countdownCircleEl.style.strokeDashoffset = 81.7 - offset;
+                countdown = Math.max(0, countdown - 1);
+                const fraction = countdown / REFRESH_INTERVAL;
+                countdownCircleEl.style.strokeDashoffset = String(81.7 * (1 - fraction));
                 refreshLabelEl.textContent = `${countdown}秒後刷新`;
-
                 if (countdown <= 0) {
                     countdown = REFRESH_INTERVAL;
-                    updateAllEtas();
+                    updateAllEtas().catch(err => console.error('自動更新失敗：', err));
                 }
             }, 1000);
         }
 
-        // 天氣獨立計時器 (每 30 分鐘 / 1800 秒在背景重刷一次天文台數據)
-        setInterval(fetchWeather, 1800000);
-
-        // 手動更新按鈕事件
-        btnRefreshAllEl.addEventListener('click', () => {
+        btnRefreshAllEl.addEventListener('click', async () => {
             countdown = REFRESH_INTERVAL;
-            updateAllEtas();
-            fetchWeather(); // 手動更新時也順便刷新天氣
+            await fetchWeather();
+            await updateAllEtas();
         });
 
-        // 9. 初始化啟動函數
         async function init() {
-            // A. 第一步：先加載時鐘與實時天氣
             updateClock();
+            setInterval(updateClock, 1000);
             fetchWeather();
-            
-            // B. 第二步：先加載全量巴士靜態資料
+            setInterval(fetchWeather, WEATHER_INTERVAL);
             const success = await fetchAllStops();
-            
-            if (success) {
-                // C. 第三步：將 "青衣碼頭" / "翠怡花園" 轉換為系統 UUID
-                resolveAllMonitorUuids();
-                
-                // D. 第四步：渲染前端卡片，關閉載入遮罩
-                renderDashboard();
-                
-                // 漸變消失動畫
-                globalLoader.classList.add('opacity-0', 'pointer-events-none');
-                setTimeout(() => {
-                    globalLoader.classList.add('hidden');
-                }, 500);
-
-                // E. 第五步：立即進行實時同步並啟用 30 秒自動刷新與時鐘計時器
-                updateAllEtas();
-                startTimer();
-            }
+            renderDashboard();
+            globalLoader.classList.add('opacity-0', 'pointer-events-none');
+            setTimeout(() => globalLoader.classList.add('hidden'), 500);
+            if (success) await updateAllEtas();
+            else monitors.forEach(m => { const el = $(`eta-list-${m.id}`); if (el) showEtaMessage(el, '站點資料載入失敗；請按「立即同步」重試。', true); });
+            startTimer();
         }
-
-        // 執行
-        init();
+        init().catch(err => {
+            console.error('初始化失敗：', err);
+            loaderStatus.textContent = `初始化失敗：${err.message || '未知錯誤'}`;
+            globalLoader.classList.add('opacity-0', 'pointer-events-none');
+            setTimeout(() => globalLoader.classList.add('hidden'), 500);
+            startTimer();
+        });
     </script>
 </body>
 </html>
